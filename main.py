@@ -1,63 +1,105 @@
-import os, logging, asyncio
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from google import genai
-from google.genai import types
+import os
+import asyncio
+import random
+import logging
+from dotenv import load_dotenv
+from telegram import Update, ReactionTypeEmoji
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, AIORateLimiter
 
-# Pulls from Render Environment Variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ALLOWED_CHATS = [46636732] 
+# LangChain & Gemini Imports
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.chat_message_histories.upstash_redis import UpstashRedisChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-logging.basicConfig(level=logging.INFO)
+# 1. Setup
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# 2. Load Umida's Brain (Gemini version)
+# Ensure this model matches the one you used in Colab to build the brain
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+vectorstore = Chroma(persist_directory="./umida_brain_db", embedding_function=embeddings)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+# Use Gemini 1.5 Flash for the fastest response times
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.3)
+
+# 3. Chain Logic
+system_prompt = (
+    "Sizning ismingiz Umida. Siz professional psixologsiz. "
+    "Foydalanuvchiga faqat O'ZBEK tilida, hamdardlik bilan javob bering.\n\n"
+    "Context:\n{context}"
+)
+
+contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Suhbat tarixini hisobga olib, savolni mustaqil holga keltiring."),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
+question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+# 4. Redis Memory Manager
+def get_session_history(session_id: str):
+    return UpstashRedisChatMessageHistory(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+        session_id=session_id,
+        ttl=2592000 # Memory lasts 30 days
+    )
+
+umida_bot = RunnableWithMessageHistory(
+    rag_chain,
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="chat_history",
+    output_messages_key="answer",
+)
+
+# 5. Telegram Message Handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id not in ALLOWED_CHATS: 
+    if not update.effective_message or not update.effective_message.text:
         return
-    
-    # Retry loop with a 60-second cooldown for Free Tier limits
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                config=types.GenerateContentConfig(
-                    system_instruction="You are Olga. Sarcastic, brief, opinionated. Use 💀 naturally.",
-                    safety_settings=[types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE")]
-                ),
-                contents=update.message.text
-            )
-            return await update.message.reply_text(response.text or "💀")
-            
-        except Exception as e:
-            err_msg = str(e)
-            
-            # If rate limited (429), wait 60 seconds before trying again
-            if "429" in err_msg:
-                logging.warning("Rate limit hit. Cooling down for 60s...")
-                await asyncio.sleep(60)
-                continue
-            
-            # Reports other real errors (Auth, etc.)
-            logging.error(f"REAL ERROR: {err_msg}")
-            return await update.message.reply_text(f"Error: {err_msg[:100]}... 💀")
 
-async def start_bot():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    
-    # Force kill webhooks to prevent "Conflict" errors
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("🔥 Olga is live. 60s cooldown logic active.")
-    
-    async with app:
-        await app.updater.start_polling()
-        await app.start()
-        while True: await asyncio.sleep(1)
+    chat_id = str(update.effective_chat.id)
+    user_text = update.effective_message.text
 
-if __name__ == '__main__':
     try:
-        asyncio.run(start_bot())
-    except KeyboardInterrupt:
-        pass
+        # 🎭 Reaction
+        await update.effective_message.set_reaction(reaction=[ReactionTypeEmoji("🫂")])
+        
+        # 🧠 Query
+        response = await asyncio.to_thread(
+            umida_bot.invoke,
+            {"input": user_text},
+            config={"configurable": {"session_id": chat_id}}
+        )
+        
+        await update.effective_message.reply_text(response['answer'].strip())
+        
+    except Exception as e:
+        logging.error(f"Error in chat {chat_id}: {e}")
+        await update.effective_message.reply_text("Kechirasiz, hozir texnik nosozlik. Iltimos, keyinroq urinib ko'ring.")
+
+# 6. Entry Point
+def main():
+    application = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).rate_limiter(AIORateLimiter()).build()
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    logging.info("🚀 Umida (Gemini Engine) is LIVE!")
+    application.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
