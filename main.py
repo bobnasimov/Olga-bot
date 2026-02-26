@@ -21,7 +21,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # 2. Load Umida's Brain (Gemini version)
 # Ensure this model matches the one you used in Colab to build the brain
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+# In section 2 of your main.py on GitHub
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 vectorstore = Chroma(persist_directory="./umida_brain_db", embedding_function=embeddings)
 retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
@@ -91,7 +92,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logging.error(f"Error in chat {chat_id}: {e}")
-        await update.effective_message.reply_text("Kechirasiz, hozir texnik nosozlik. Iltimos, keyinroq urinib ko'ring.")
+        await update.effective_message.reply_text("Kechirasiz, menda juda zarur ish chiqib qoldi. Iltimos, keyinroq gaplashaylik.")
 
 # 6. Entry Point
 def main():
